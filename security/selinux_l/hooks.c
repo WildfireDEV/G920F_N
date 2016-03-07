@@ -95,18 +95,45 @@
 #include "audit.h"
 #include "avc_ss.h"
 
+#ifdef CONFIG_RKP_NS_PROT
+extern unsigned int cmp_ns_integrity(void);
+#else
+unsigned int cmp_ns_integrity(void)
+{
+	return 0;
+}
+#endif
 #define NUM_SEL_MNT_OPTS 5
 
 #ifdef CONFIG_RKP_KDP
 #include<linux/rkp_entry.h>
+
+extern struct kmem_cache *tsec_jar;
+extern void rkp_free_security(unsigned long tsec);
 u8 rkp_ro_page(unsigned long addr);
-static inline unsigned int cmp_sec_integrity(void)
+static inline unsigned int cmp_sec_integrity(const struct cred *cred,struct mm_struct *mm)
 {
-	return ((current->cred->bp_task != current)||
-			(current->mm && 
-			(!( in_interrupt() || in_softirq() )) && 
-			(current->mm->pgd != current->cred->bp_pgd)));
-			
+	return ((cred->bp_task != current)||
+			(mm && (!( in_interrupt() || in_softirq())) && 
+			(mm->pgd != cred->bp_pgd)));
+}
+extern char __rkp_initsec[];
+static inline unsigned int rkp_is_valid_cred_sp(u64 cred,u64 sp)
+{
+		struct task_security_struct *tsec = (struct task_security_struct *)sp;
+
+		if((cred == (u64)__rkp_ro_start) /*&& 
+			( sp == (u64)__rkp_initsec)*/){
+			return 0;
+		}
+		if(!rkp_ro_page(cred)|| !rkp_ro_page(cred+sizeof(struct cred))||
+			(!rkp_ro_page(sp)|| !rkp_ro_page(sp+sizeof(struct task_security_struct)))) {
+			return 1;
+		}
+		if((u64)tsec->bp_cred != cred) {
+			return 1;
+		}
+		return 0;
 }
 inline void rkp_print_debug(void)
 {
@@ -119,20 +146,30 @@ inline void rkp_print_debug(void)
 	printk(KERN_ERR"\n RKP44 cred = %p bp_task = %p bp_pgd = %p pgd = %llx stat = #%d# task = %p mm = %p \n",cred,cred->bp_task,cred->bp_pgd,pgd,(int)rkp_ro_page((unsigned long long)cred),current,current->mm);
 
 	printk(KERN_ERR"\n RKP44_1 uid = %d gid = %d euid = %d  egid = %d \n",cred->uid,cred->gid,cred->euid,cred->egid);
+	printk(KERN_ERR"\n RKP44_2 Cred %llx #%d# #%d# Sec ptr %llx #%d# #%d#\n",(u64)cred,rkp_ro_page((u64)cred),rkp_ro_page((u64)cred+sizeof(struct cred)),(u64)cred->security, rkp_ro_page((u64)cred->security),rkp_ro_page((u64)cred->security+sizeof(struct task_security_struct)));
 
 }
+
 /* Main function to verify cred security context of a process */
 int security_integrity_current(void)
 {
 	if ( rkp_cred_enable && 
-		(!rkp_ro_page((unsigned long)current->cred)||
-		cmp_sec_integrity())) {
+		(rkp_is_valid_cred_sp((u64)current_cred(),(u64)current_cred()->security)||
+		cmp_sec_integrity(current_cred(),current->mm)||
+		cmp_ns_integrity())) {
 		rkp_print_debug();
 		panic("RKP CRED PROTECTION VIOLATION\n");
 	}
 	return 0;
 }
-
+unsigned int rkp_get_task_sec_size(void)
+{
+	return sizeof(struct task_security_struct);
+}
+unsigned int rkp_get_offset_bp_cred(void)
+{
+	return offsetof(struct task_security_struct,bp_cred);
+}
 #endif  /* CONFIG_RKP_KDP */
 
 extern struct security_operations *security_ops;
@@ -140,22 +177,7 @@ extern struct security_operations *security_ops;
 /* SECMARK reference count */
 static atomic_t selinux_secmark_refcount = ATOMIC_INIT(0);
 
-#ifdef CONFIG_SECURITY_SELINUX_DEVELOP
-int selinux_enforcing;
-
-static int __init enforcing_setup(char *str)
-{
-	unsigned long enforcing;
-	if (!strict_strtoul(str, 0, &enforcing))
-#ifdef CONFIG_ALWAYS_ENFORCE
-		selinux_enforcing = 1;
-#else
-		selinux_enforcing = enforcing ? 1 : 0;
-#endif
-	return 1;
-}
-__setup("enforcing=", enforcing_setup);
-#endif
+int selinux_enforcing = 0;
 
 #ifdef CONFIG_SECURITY_SELINUX_BOOTPARAM
 int selinux_enabled = CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE;
@@ -164,11 +186,7 @@ static int __init selinux_enabled_setup(char *str)
 {
 	unsigned long enabled;
 	if (!strict_strtoul(str, 0, &enabled))
-#ifdef CONFIG_ALWAYS_ENFORCE
-		selinux_enabled = 1;
-#else
 		selinux_enabled = enabled ? 1 : 0;
-#endif
 	return 1;
 }
 __setup("selinux=", selinux_enabled_setup);
@@ -192,7 +210,9 @@ static int selinux_secmark_enabled(void)
 {
 	return (atomic_read(&selinux_secmark_refcount) > 0);
 }
-
+#ifdef CONFIG_RKP_KDP
+RKP_RO_AREA struct task_security_struct init_sec;
+#endif
 /*
  * initialise the security for the init task
  */
@@ -200,11 +220,14 @@ static void cred_init_security(void)
 {
 	struct cred *cred = (struct cred *) current->real_cred;
 	struct task_security_struct *tsec;
-
+#ifdef CONFIG_RKP_KDP
+	tsec = &init_sec;
+	tsec->bp_cred = cred;
+#else
 	tsec = kzalloc(sizeof(struct task_security_struct), GFP_KERNEL);
 	if (!tsec)
 		panic("SELinux:  Failed to initialize initial task.\n");
-
+#endif
 	tsec->osid = tsec->sid = SECINITSID_KERNEL;
 	cred->security = tsec;
 }
@@ -3014,7 +3037,7 @@ static noinline int audit_inode_permission(struct inode *inode,
 	ad.u.inode = inode;
 
 	rc = slow_avc_audit(current_sid(), isec->sid, isec->sclass, perms,
-			    audited, denied, result, &ad, flags);
+			    audited, 0, result, &ad, flags);
 	if (rc)
 		return rc;
 	return 0;
@@ -3059,7 +3082,7 @@ static int selinux_inode_permission(struct inode *inode, int mask)
 	if (likely(!audited))
 		return rc;
 
-	rc2 = audit_inode_permission(inode, perms, audited, denied, rc, flags);
+	rc2 = audit_inode_permission(inode, perms, audited, 0, rc, flags);
 	if (rc2)
 		return rc2;
 	return rc;
@@ -3425,6 +3448,44 @@ static void selinux_file_free_security(struct file *file)
 	file_free_security(file);
 }
 
+/*
+ * Check whether a task has the ioctl permission and cmd
+ * operation to an inode.
+ */
+int ioctl_has_perm(const struct cred *cred, struct file *file,
+		u32 requested, u16 cmd)
+{
+	struct common_audit_data ad;
+	struct file_security_struct *fsec = file->f_security;
+	struct inode *inode = file_inode(file);
+	struct inode_security_struct *isec = inode->i_security;
+	struct lsm_ioctlop_audit ioctl;
+	u32 ssid = cred_sid(cred);
+	int rc;
+
+	ad.type = LSM_AUDIT_DATA_IOCTL_OP;
+	ad.u.op = &ioctl;
+	ad.u.op->cmd = cmd;
+	ad.u.op->path = file->f_path;
+
+	if (ssid != fsec->sid) {
+		rc = avc_has_perm(ssid, fsec->sid,
+				SECCLASS_FD,
+				FD__USE,
+				&ad);
+		if (rc)
+			goto out;
+	}
+
+	if (unlikely(IS_PRIVATE(inode)))
+		return 0;
+
+	rc = avc_has_operation(ssid, isec->sid, isec->sclass,
+			requested, cmd, &ad);
+out:
+	return rc;
+}
+
 static int selinux_file_ioctl(struct file *file, unsigned int cmd,
 			      unsigned long arg)
 {
@@ -3472,7 +3533,7 @@ static int selinux_file_ioctl(struct file *file, unsigned int cmd,
 	 * to the file's ioctl() function.
 	 */
 	default:
-		error = file_has_perm(cred, file, FILE__IOCTL);
+		error = ioctl_has_perm(cred, file, FILE__IOCTL, (u16) cmd);
 	}
 	return error;
 }
@@ -3784,7 +3845,11 @@ static void selinux_cred_free(struct cred *cred)
 	} else
 #endif /*CONFIG_RKP_KDP*/
 	cred->security = (void *) 0x7UL;
+#ifdef CONFIG_RKP_KDP
+	rkp_free_security((unsigned long)tsec);
+#else/*CONFIG_RKP_KDP*/
 	kfree(tsec);
+#endif /*CONFIG_RKP_KDP*/
 }
 
 /*
@@ -5246,11 +5311,7 @@ static int selinux_nlmsg_perm(struct sock *sk, struct sk_buff *skb)
 				  "SELinux:  unrecognized netlink message"
 				  " type=%hu for sclass=%hu\n",
 				  nlh->nlmsg_type, sksec->sclass);
-#ifdef CONFIG_ALWAYS_ENFORCE
-			if (security_get_allow_unknown())
-#else
 			if (!selinux_enforcing || security_get_allow_unknown())
-#endif
 				err = 0;
 		}
 
@@ -6453,7 +6514,7 @@ static int selinux_key_getsecurity(struct key *key, char **_buffer)
 
 #endif
 
-static struct security_operations selinux_ops = {
+RKP_RO_AREA static struct security_operations selinux_ops = {
 	.name =				"selinux",
 
 	.binder_set_context_mgr =	selinux_binder_set_context_mgr,
@@ -6663,11 +6724,7 @@ static struct security_operations selinux_ops = {
 static __init int selinux_init(void)
 {
 	if (!security_module_enable(&selinux_ops)) {
-#ifdef CONFIG_ALWAYS_ENFORCE
-		selinux_enabled = 1;
-#else
 		selinux_enabled = 0;
-#endif
 		return 0;
 	}
 
@@ -6690,9 +6747,6 @@ static __init int selinux_init(void)
 
 	if (register_security(&selinux_ops))
 		panic("SELinux: Unable to register with kernel.\n");
-#ifdef CONFIG_ALWAYS_ENFORCE
-	selinux_enforcing = 1;
-#endif
 	if (selinux_enforcing)
 		printk(KERN_DEBUG "SELinux:  Starting in enforcing mode\n");
 	else
@@ -6769,9 +6823,6 @@ static struct nf_hook_ops selinux_ipv6_ops[] = {
 static int __init selinux_nf_ip_init(void)
 {
 	int err = 0;
-#ifdef CONFIG_ALWAYS_ENFORCE
-	selinux_enabled = 1;
-#endif
 	if (!selinux_enabled)
 		goto out;
 
