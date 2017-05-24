@@ -135,7 +135,7 @@ FUNC_BUILD_RAMDISK()
 		cd ~
 		cd Samsung_Nougat
 		rm -f $RDIR/ramdisk/SM-G925F/split_img/boot.img-zImage
-		mv -f $RDIR/arch/$ARCH/boot/boot.img-zImage $RDIR/ramdisk/SM-G925F/split_img/boot.img-zImageZ
+		mv -f $RDIR/arch/$ARCH/boot/boot.img-zImage $RDIR/ramdisk/SM-G925F/split_img/boot.img-zImage
 		cd $RDIR/ramdisk/SM-G925F
 		./repackimg.sh
 		echo SEANDROIDENFORCE >> boots6e.img
